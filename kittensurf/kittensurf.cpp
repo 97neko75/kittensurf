@@ -1,430 +1,1127 @@
-﻿// KittenSurf.cpp : 定义应用程序的入口点。
-//
+#ifdef _MSC_VER
+#pragma execution_character_set("utf-8")
+#endif
 
 #include "framework.h"
-#include "KittenSurf.h"
+#include "kittensurf.h"
 
-#include <windows.h>
-#include <objbase.h>
 #include <gdiplus.h>
 #include <winhttp.h>
+
+#include <algorithm>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <cwctype>
+#include <cwchar>
+#include <limits>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
-#include <sstream>
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "winhttp.lib")
 
 using namespace Gdiplus;
 
-#define MAX_LOADSTRING 100
+ATOM registerWindowClass(HINSTANCE instance);
+BOOL initializeInstance(HINSTANCE instance, int showCommand);
+LRESULT CALLBACK WndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+INT_PTR CALLBACK About(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam);
 
-// 全局变量:
-HINSTANCE hInst;
-WCHAR szTitle[MAX_LOADSTRING];
-WCHAR szWindowClass[MAX_LOADSTRING];
-std::wstring g_htmlContent = L"<html><body><p>正在加载...</p></body></html>";
-
-// 控件句柄
-HWND g_hUrlBar = NULL;
-HWND g_hGoButton = NULL;
-
-// 函数前向声明:
-ATOM                MyRegisterClass(HINSTANCE hInstance);
-BOOL                InitInstance(HINSTANCE, int);
-LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
-INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
-
-// ========================== 核心功能 ==========================
-
-// 提取所有可见文本
-std::wstring extractVisibleText(const std::wstring& html)
+namespace
 {
-    std::wstring result;
-    bool inTag = false;
-    bool inScript = false;
-    bool inStyle = false;
-    bool inComment = false;
+constexpr int kMaxLoadString = 100;
+constexpr int kGoButtonId = 1;
+constexpr UINT kPageLoadedMessage = WM_APP + 1;
+constexpr std::size_t kMaxDocumentBytes = 16u * 1024u * 1024u;
+constexpr wchar_t kCarriageReturn = static_cast<wchar_t>(13);
+constexpr wchar_t kLineFeed = static_cast<wchar_t>(10);
 
-    for (size_t i = 0; i < html.length(); ++i)
+constexpr wchar_t kLoadingPage[] = L"<html><body><p>正在加载...</p></body></html>";
+constexpr wchar_t kEmptyPage[] = L"<html><body></body></html>";
+
+HINSTANCE g_instance = nullptr;
+WCHAR g_windowTitle[kMaxLoadString] = {};
+WCHAR g_windowClass[kMaxLoadString] = {};
+HWND g_urlBar = nullptr;
+HWND g_goButton = nullptr;
+ULONG_PTR g_gdiplusToken = 0;
+
+struct PageState
+{
+    std::mutex mutex;
+    std::condition_variable workersFinished;
+    std::wstring html = kLoadingPage;
+    std::uint64_t generation = 0;
+    std::size_t activeWorkers = 0;
+    bool closing = false;
+};
+
+PageState g_pageState;
+
+class WinHttpHandle final
+{
+public:
+    explicit WinHttpHandle(HINTERNET handle = nullptr) noexcept : handle_(handle) {}
+    ~WinHttpHandle()
     {
-        wchar_t ch = html[i];
-
-        if (!inComment && i + 3 < html.length() && html.substr(i, 4) == L"<!--")
-        {
-            inComment = true;
-            continue;
-        }
-        if (inComment && i + 2 < html.length() && html.substr(i, 3) == L"-->")
-        {
-            inComment = false;
-            i += 2;
-            continue;
-        }
-        if (inComment) continue;
-
-        if (!inTag && ch == L'<')
-        {
-            if (i + 6 < html.length() && html.substr(i, 7) == L"<script") inScript = true;
-            if (i + 5 < html.length() && html.substr(i, 6) == L"<style") inStyle = true;
-            inTag = true;
-            continue;
-        }
-
-        if (inTag && ch == L'>')
-        {
-            inTag = false;
-            if (inScript && i >= 8 && html.substr(i - 8, 9) == L"</script>") inScript = false;
-            if (inStyle && i >= 7 && html.substr(i - 7, 8) == L"</style>") inStyle = false;
-            continue;
-        }
-
-        if (inTag || inScript || inStyle) continue;
-        result += ch;
+        reset();
     }
 
-    std::wstring cleaned;
-    bool lastWasSpace = false;
-    for (wchar_t ch : result)
+    WinHttpHandle(const WinHttpHandle&) = delete;
+    WinHttpHandle& operator=(const WinHttpHandle&) = delete;
+
+    WinHttpHandle(WinHttpHandle&& other) noexcept : handle_(other.handle_)
     {
-        if (ch == L' ' || ch == L'\t' || ch == L'\r' || ch == L'\n')
-        {
-            if (!lastWasSpace)
-            {
-                cleaned += L' ';
-                lastWasSpace = true;
-            }
-        }
-        else
-        {
-            cleaned += ch;
-            lastWasSpace = false;
-        }
+        other.handle_ = nullptr;
     }
-    return cleaned;
+
+    WinHttpHandle& operator=(WinHttpHandle&& other) noexcept
+    {
+        if (this != &other)
+        {
+            reset();
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    HINTERNET get() const noexcept
+    {
+        return handle_;
+    }
+
+    explicit operator bool() const noexcept
+    {
+        return handle_ != nullptr;
+    }
+
+    void reset(HINTERNET handle = nullptr) noexcept
+    {
+        if (handle_ != nullptr)
+        {
+            WinHttpCloseHandle(handle_);
+        }
+        handle_ = handle;
+    }
+
+private:
+    HINTERNET handle_ = nullptr;
+};
+
+wchar_t lowerWide(wchar_t value)
+{
+    return static_cast<wchar_t>(std::towlower(value));
 }
 
-// 渲染文本
-void renderText(Graphics& graphics, const std::wstring& text, int x, int y, int maxWidth)
+bool equalsInsensitive(const std::wstring& value, const wchar_t* expected)
 {
-    Font font(L"微软雅黑", 14);
-    SolidBrush brush(Color(0, 0, 0));
-    RectF layoutRect((float)x, (float)y, (float)maxWidth, 10000.0f);
-    graphics.DrawString(text.c_str(), -1, &font, layoutRect, NULL, &brush);
-}
-
-// WinHTTP 网络请求
-std::wstring fetchURL(const std::wstring& url)
-{
-    std::wstring result;
-    HINTERNET hSession = WinHttpOpen(L"KittenSurf/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
-    if (!hSession) return L"HTTP 初始化失败";
-
-    URL_COMPONENTS urlComp = { 0 };
-    urlComp.dwStructSize = sizeof(urlComp);
-    wchar_t hostName[256] = { 0 };
-    wchar_t urlPath[1024] = { 0 };
-    urlComp.lpszHostName = hostName;
-    urlComp.dwHostNameLength = 256;
-    urlComp.lpszUrlPath = urlPath;
-    urlComp.dwUrlPathLength = 1024;
-
-    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &urlComp))
+    const std::size_t expectedLength = std::wcslen(expected);
+    if (value.size() != expectedLength)
     {
-        WinHttpCloseHandle(hSession);
-        return L"URL 解析失败";
+        return false;
     }
 
-    HINTERNET hConnect = WinHttpConnect(hSession, hostName, urlComp.nPort, 0);
-    if (!hConnect)
+    for (std::size_t i = 0; i < expectedLength; ++i)
     {
-        WinHttpCloseHandle(hSession);
-        return L"连接失败";
-    }
-
-    DWORD flags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", urlPath, NULL, NULL, NULL, flags);
-    if (!hRequest)
-    {
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return L"请求创建失败";
-    }
-
-    WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
-    WinHttpReceiveResponse(hRequest, NULL);
-
-    DWORD bytesRead = 0;
-    char buffer[4096];
-    std::string utf8Data;
-    while (WinHttpReadData(hRequest, buffer, sizeof(buffer) - 1, &bytesRead) && bytesRead > 0)
-    {
-        buffer[bytesRead] = '\0';
-        utf8Data += buffer;
-    }
-
-    if (!utf8Data.empty())
-    {
-        int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8Data.c_str(), -1, NULL, 0);
-        if (wlen > 0)
+        if (lowerWide(value[i]) != lowerWide(expected[i]))
         {
-            wchar_t* wbuf = new wchar_t[wlen];
-            MultiByteToWideChar(CP_UTF8, 0, utf8Data.c_str(), -1, wbuf, wlen);
-            result = wbuf;
-            delete[] wbuf;
+            return false;
         }
     }
+    return true;
+}
 
-    WinHttpCloseHandle(hRequest);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
-
-    if (result.empty())
+bool startsWithInsensitive(const std::wstring& value, const wchar_t* prefix)
+{
+    const std::size_t prefixLength = std::wcslen(prefix);
+    if (value.size() < prefixLength)
     {
-        result = L"<html><body><p>获取内容为空或请求失败</p></body></html>";
+        return false;
+    }
+
+    for (std::size_t i = 0; i < prefixLength; ++i)
+    {
+        if (lowerWide(value[i]) != lowerWide(prefix[i]))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::wstring trimWhitespace(const std::wstring& value)
+{
+    std::size_t begin = 0;
+    while (begin < value.size() && std::iswspace(value[begin]) != 0)
+    {
+        ++begin;
+    }
+
+    std::size_t end = value.size();
+    while (end > begin && std::iswspace(value[end - 1]) != 0)
+    {
+        --end;
+    }
+
+    return value.substr(begin, end - begin);
+}
+
+std::wstring normalizeUrl(const std::wstring& value)
+{
+    const std::wstring trimmed = trimWhitespace(value);
+    if (trimmed.empty())
+    {
+        return L"about:blank";
+    }
+
+    if (startsWithInsensitive(trimmed, L"http://") ||
+        startsWithInsensitive(trimmed, L"https://") ||
+        startsWithInsensitive(trimmed, L"about:"))
+    {
+        return trimmed;
+    }
+
+    return L"https://" + trimmed;
+}
+
+std::wstring readWindowText(HWND window)
+{
+    if (window == nullptr)
+    {
+        return {};
+    }
+
+    const int length = GetWindowTextLengthW(window);
+    if (length <= 0)
+    {
+        return {};
+    }
+
+    std::wstring value(static_cast<std::size_t>(length) + 1, wchar_t{});
+    const int copied = GetWindowTextW(window, value.data(), static_cast<int>(value.size()));
+    value.resize(copied > 0 ? static_cast<std::size_t>(copied) : 0);
+    return value;
+}
+
+std::wstring makeErrorPage(const wchar_t* message)
+{
+    return std::wstring(L"<html><body><p>") + message + L"</p></body></html>";
+}
+
+std::wstring decodeResponse(const std::string& bytes)
+{
+    if (bytes.empty())
+    {
+        return {};
+    }
+
+    std::size_t offset = 0;
+    if (bytes.size() >= 3 &&
+        static_cast<unsigned char>(bytes[0]) == 0xef &&
+        static_cast<unsigned char>(bytes[1]) == 0xbb &&
+        static_cast<unsigned char>(bytes[2]) == 0xbf)
+    {
+        offset = 3;
+    }
+
+    if (bytes.size() - offset > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    {
+        return {};
+    }
+
+    const char* data = bytes.data() + offset;
+    const int length = static_cast<int>(bytes.size() - offset);
+    int wideLength = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, data, length, nullptr, 0);
+    UINT codePage = CP_UTF8;
+    DWORD flags = MB_ERR_INVALID_CHARS;
+
+    if (wideLength <= 0)
+    {
+        codePage = CP_ACP;
+        flags = 0;
+        wideLength = MultiByteToWideChar(codePage, flags, data, length, nullptr, 0);
+    }
+
+    if (wideLength <= 0)
+    {
+        return {};
+    }
+
+    std::wstring result(static_cast<std::size_t>(wideLength), wchar_t{});
+    if (MultiByteToWideChar(codePage, flags, data, length, result.data(), wideLength) <= 0)
+    {
+        return {};
     }
     return result;
 }
 
-// 从网址栏加载内容
-void loadUrlFromBar(HWND hWnd)
+std::wstring fetchUrl(const std::wstring& url)
 {
-    wchar_t url[2048];
-    GetWindowTextW(g_hUrlBar, url, 2048);
-    if (wcslen(url) > 0)
+    if (!startsWithInsensitive(url, L"http://") &&
+        !startsWithInsensitive(url, L"https://"))
     {
-        std::wstring urlStr = url;
-        if (urlStr.find(L"http://") == std::wstring::npos &&
-            urlStr.find(L"https://") == std::wstring::npos)
-        {
-            urlStr = L"http://" + urlStr;
-        }
-        g_htmlContent = L"<html><body><p>正在加载...</p></body></html>";
-        InvalidateRect(hWnd, NULL, TRUE);
+        return makeErrorPage(L"仅支持 http:// 和 https:// 地址");
+    }
 
-        CreateThread(NULL, 0, [](LPVOID param) -> DWORD
+    if (url.size() > 32768 || url.size() >= static_cast<std::size_t>(std::numeric_limits<DWORD>::max()))
+    {
+        return makeErrorPage(L"URL 太长");
+    }
+
+    std::vector<wchar_t> hostBuffer(url.size() + 1);
+    std::vector<wchar_t> pathBuffer(url.size() + 1);
+    std::vector<wchar_t> extraBuffer(url.size() + 1);
+
+    URL_COMPONENTS components{};
+    components.dwStructSize = sizeof(components);
+    components.lpszHostName = hostBuffer.data();
+    components.dwHostNameLength = static_cast<DWORD>(hostBuffer.size());
+    components.lpszUrlPath = pathBuffer.data();
+    components.dwUrlPathLength = static_cast<DWORD>(pathBuffer.size());
+    components.lpszExtraInfo = extraBuffer.data();
+    components.dwExtraInfoLength = static_cast<DWORD>(extraBuffer.size());
+
+    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &components))
+    {
+        return makeErrorPage(L"URL 解析失败");
+    }
+
+    if (components.nScheme != INTERNET_SCHEME_HTTP &&
+        components.nScheme != INTERNET_SCHEME_HTTPS)
+    {
+        return makeErrorPage(L"不支持的 URL 协议");
+    }
+
+    if (components.dwHostNameLength == 0)
+    {
+        return makeErrorPage(L"URL 缺少主机名");
+    }
+
+    const std::wstring hostName(hostBuffer.data(), components.dwHostNameLength);
+    std::wstring requestTarget(pathBuffer.data(), components.dwUrlPathLength);
+    std::wstring extraInfo(extraBuffer.data(), components.dwExtraInfoLength);
+
+    const std::size_t fragment = extraInfo.find(L'#');
+    if (fragment != std::wstring::npos)
+    {
+        extraInfo.resize(fragment);
+    }
+    if (requestTarget.empty())
+    {
+        requestTarget = L"/";
+    }
+    requestTarget += extraInfo;
+
+    WinHttpHandle session(WinHttpOpen(
+        L"KittenSurf/1.1",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0));
+    if (!session)
+    {
+        return makeErrorPage(L"HTTP 初始化失败");
+    }
+
+    WinHttpSetTimeouts(session.get(), 5000, 5000, 5000, 10000);
+
+    WinHttpHandle connection(WinHttpConnect(session.get(), hostName.c_str(), components.nPort, 0));
+    if (!connection)
+    {
+        return makeErrorPage(L"连接失败");
+    }
+
+    const DWORD requestFlags = components.nScheme == INTERNET_SCHEME_HTTPS
+        ? WINHTTP_FLAG_SECURE
+        : 0;
+    WinHttpHandle request(WinHttpOpenRequest(
+        connection.get(),
+        L"GET",
+        requestTarget.c_str(),
+        nullptr,
+        WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        requestFlags));
+    if (!request)
+    {
+        return makeErrorPage(L"请求创建失败");
+    }
+
+    constexpr wchar_t requestHeaders[] = L"Accept-Encoding: identity";
+    if (!WinHttpSendRequest(
+        request.get(),
+        requestHeaders,
+        static_cast<DWORD>(-1L),
+        WINHTTP_NO_REQUEST_DATA,
+        0,
+        0,
+        0) || !WinHttpReceiveResponse(request.get(), nullptr))
+    {
+        return makeErrorPage(L"网络请求失败");
+    }
+
+    DWORD statusCode = 0;
+    DWORD statusSize = sizeof(statusCode);
+    if (!WinHttpQueryHeaders(
+        request.get(),
+        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX,
+        &statusCode,
+        &statusSize,
+        WINHTTP_NO_HEADER_INDEX))
+    {
+        return makeErrorPage(L"无法读取 HTTP 状态");
+    }
+
+    if (statusCode < 200 || statusCode >= 400)
+    {
+        return makeErrorPage(L"服务器返回了非成功状态");
+    }
+
+    std::string response;
+    char buffer[8192];
+    for (;;)
+    {
+        DWORD bytesRead = 0;
+        if (!WinHttpReadData(request.get(), buffer, sizeof(buffer), &bytesRead))
+        {
+            return makeErrorPage(L"读取响应失败");
+        }
+        if (bytesRead == 0)
+        {
+            break;
+        }
+        if (response.size() > kMaxDocumentBytes ||
+            bytesRead > kMaxDocumentBytes - response.size())
+        {
+            return makeErrorPage(L"页面超过 16 MiB 限制");
+        }
+        response.append(buffer, bytesRead);
+    }
+
+    if (response.empty())
+    {
+        return makeErrorPage(L"服务器返回了空页面");
+    }
+
+    const std::wstring decoded = decodeResponse(response);
+    return decoded.empty() ? makeErrorPage(L"页面编码无法识别") : decoded;
+}
+
+std::size_t findTagEnd(const std::wstring& html, std::size_t begin)
+{
+    wchar_t quote = 0;
+    for (std::size_t i = begin; i < html.size(); ++i)
+    {
+        const wchar_t ch = html[i];
+        if (quote != 0)
+        {
+            if (ch == quote)
             {
-                HWND hwnd = (HWND)param;
-                wchar_t url[2048];
-                GetWindowTextW(g_hUrlBar, url, 2048);
-                std::wstring urlStr = url;
-                if (urlStr.find(L"http://") == std::wstring::npos &&
-                    urlStr.find(L"https://") == std::wstring::npos)
-                {
-                    urlStr = L"http://" + urlStr;
-                }
-                std::wstring html = fetchURL(urlStr);
-                g_htmlContent = html.empty() ? L"<html><body><p>网络请求失败</p></body></html>" : html;
-                InvalidateRect(hwnd, NULL, TRUE);
-                return 0;
-            }, hWnd, 0, NULL);
+                quote = 0;
+            }
+        }
+        else if (ch == static_cast<wchar_t>(39) || ch == L'"')
+        {
+            quote = ch;
+        }
+        else if (ch == L'>')
+        {
+            return i;
+        }
     }
+    return std::wstring::npos;
 }
 
-// ========================== Windows 标准函数 ==========================
-
-int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
-    _In_opt_ HINSTANCE hPrevInstance,
-    _In_ LPWSTR    lpCmdLine,
-    _In_ int       nCmdShow)
+std::wstring extractTagName(const std::wstring& rawTag)
 {
-    UNREFERENCED_PARAMETER(hPrevInstance);
-    UNREFERENCED_PARAMETER(lpCmdLine);
-
-    // 初始化全局字符串
-    LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
-    LoadStringW(hInstance, IDC_KITTENSURF, szWindowClass, MAX_LOADSTRING);
-    MyRegisterClass(hInstance);
-
-    // 执行应用程序初始化:
-    if (!InitInstance(hInstance, nCmdShow))
+    std::size_t begin = 0;
+    while (begin < rawTag.size() && std::iswspace(rawTag[begin]) != 0)
     {
-        return FALSE;
+        ++begin;
+    }
+    if (begin < rawTag.size() && rawTag[begin] == L'/')
+    {
+        ++begin;
+    }
+    while (begin < rawTag.size() && std::iswspace(rawTag[begin]) != 0)
+    {
+        ++begin;
     }
 
-    HACCEL hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_KITTENSURF));
-
-
-    MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0))
+    std::size_t end = begin;
+    while (end < rawTag.size() &&
+           (std::iswalnum(rawTag[end]) != 0 || rawTag[end] == L'-' || rawTag[end] == L'_'))
     {
-        if (!TranslateAccelerator(msg.hwnd, hAccelTable, &msg))
+        ++end;
+    }
+
+    std::wstring name = rawTag.substr(begin, end - begin);
+    for (wchar_t& ch : name)
+    {
+        ch = lowerWide(ch);
+    }
+    return name;
+}
+
+bool isClosingTag(const std::wstring& rawTag)
+{
+    std::size_t begin = 0;
+    while (begin < rawTag.size() && std::iswspace(rawTag[begin]) != 0)
+    {
+        ++begin;
+    }
+    return begin < rawTag.size() && rawTag[begin] == L'/';
+}
+
+bool findClosingRawTag(
+    const std::wstring& html,
+    std::size_t begin,
+    const std::wstring& name,
+    std::size_t& end)
+{
+    if (begin + 2 + name.size() > html.size() || html[begin] != L'<' || html[begin + 1] != L'/')
+    {
+        return false;
+    }
+
+    std::size_t nameBegin = begin + 2;
+    while (nameBegin < html.size() && std::iswspace(html[nameBegin]) != 0)
+    {
+        ++nameBegin;
+    }
+    if (nameBegin + name.size() > html.size())
+    {
+        return false;
+    }
+
+    for (std::size_t i = 0; i < name.size(); ++i)
+    {
+        if (lowerWide(html[nameBegin + i]) != name[i])
         {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
+            return false;
         }
     }
 
-    return (int)msg.wParam;
+    const std::size_t afterName = nameBegin + name.size();
+    if (afterName < html.size() &&
+        std::iswspace(html[afterName]) == 0 &&
+        html[afterName] != L'>' &&
+        html[afterName] != L'/')
+    {
+        return false;
+    }
+
+    end = findTagEnd(html, begin);
+    return end != std::wstring::npos;
 }
 
-//
-//  函数: MyRegisterClass()
-//  目标: 注册窗口类。
-//
-ATOM MyRegisterClass(HINSTANCE hInstance)
+bool isBlockTag(const std::wstring& name)
 {
-    WNDCLASSEXW wcex;
-    wcex.cbSize = sizeof(WNDCLASSEX);
+    static constexpr const wchar_t* blockTags[] =
+    {
+        L"address", L"article", L"aside", L"blockquote", L"body", L"br", L"caption",
+        L"dd", L"div", L"dl", L"dt", L"fieldset", L"figcaption", L"figure", L"footer",
+        L"form", L"h1", L"h2", L"h3", L"h4", L"h5", L"h6", L"head", L"header",
+        L"hr", L"html", L"li", L"main", L"nav", L"ol", L"p", L"pre", L"section",
+        L"table", L"tbody", L"td", L"tfoot", L"th", L"thead", L"title", L"tr", L"ul"
+    };
 
-    wcex.style = CS_HREDRAW | CS_VREDRAW;
-    wcex.lpfnWndProc = WndProc;
-    wcex.cbClsExtra = 0;
-    wcex.cbWndExtra = 0;
-    wcex.hInstance = hInstance;
-    wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_KITTENSURF));
-    wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wcex.lpszMenuName = MAKEINTRESOURCEW(IDC_KITTENSURF);
-    wcex.lpszClassName = szWindowClass;
-    wcex.hIconSm = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_SMALL));
-
-    return RegisterClassExW(&wcex);
+    for (const wchar_t* blockTag : blockTags)
+    {
+        if (name == blockTag)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
-//
-//   函数: InitInstance(HINSTANCE, int)
-//   目标: 保存实例句柄并创建主窗口
-//
-BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
+void appendCodePoint(std::wstring& output, std::uint32_t codePoint)
 {
-    hInst = hInstance;
+    if (codePoint == 0 || codePoint > 0x10ffff ||
+        (codePoint >= 0xd800 && codePoint <= 0xdfff))
+    {
+        output += static_cast<wchar_t>(0xfffd);
+        return;
+    }
 
-    HWND hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInstance, nullptr);
+    if (sizeof(wchar_t) == 2 && codePoint > 0xffff)
+    {
+        codePoint -= 0x10000;
+        output += static_cast<wchar_t>(0xd800 + (codePoint >> 10));
+        output += static_cast<wchar_t>(0xdc00 + (codePoint & 0x3ff));
+    }
+    else
+    {
+        output += static_cast<wchar_t>(codePoint);
+    }
+}
 
-    if (!hWnd)
+bool parseNumericEntity(const std::wstring& token, std::uint32_t& value)
+{
+    if (token.size() < 2 || token[0] != L'#')
+    {
+        return false;
+    }
+
+    std::size_t begin = 1;
+    int base = 10;
+    if (begin < token.size() && (token[begin] == L'x' || token[begin] == L'X'))
+    {
+        base = 16;
+        ++begin;
+    }
+    if (begin == token.size())
+    {
+        return false;
+    }
+
+    std::uint32_t parsed = 0;
+    for (; begin < token.size(); ++begin)
+    {
+        const wchar_t ch = token[begin];
+        int digit = -1;
+        if (ch >= L'0' && ch <= L'9')
+        {
+            digit = ch - L'0';
+        }
+        else if (base == 16 && ch >= L'a' && ch <= L'f')
+        {
+            digit = ch - L'a' + 10;
+        }
+        else if (base == 16 && ch >= L'A' && ch <= L'F')
+        {
+            digit = ch - L'A' + 10;
+        }
+        if (digit < 0 || digit >= base || parsed > (0x10ffffu - static_cast<std::uint32_t>(digit)) / static_cast<std::uint32_t>(base))
+        {
+            return false;
+        }
+        parsed = parsed * static_cast<std::uint32_t>(base) + static_cast<std::uint32_t>(digit);
+    }
+
+    value = parsed;
+    return true;
+}
+
+std::wstring decodeHtmlEntities(const std::wstring& value)
+{
+    std::wstring result;
+    result.reserve(value.size());
+
+    for (std::size_t i = 0; i < value.size(); ++i)
+    {
+        if (value[i] != L'&')
+        {
+            result += value[i];
+            continue;
+        }
+
+        const std::size_t end = value.find(L';', i + 1);
+        if (end == std::wstring::npos || end - i > 16)
+        {
+            result += value[i];
+            continue;
+        }
+
+        const std::wstring token = value.substr(i + 1, end - i - 1);
+        if (token == L"amp") result += L'&';
+        else if (token == L"lt") result += L'<';
+        else if (token == L"gt") result += L'>';
+        else if (token == L"quot") result += L'"';
+        else if (token == L"apos") result += static_cast<wchar_t>(39);
+        else if (token == L"nbsp") result += static_cast<wchar_t>(0x00a0);
+        else
+        {
+            std::uint32_t codePoint = 0;
+            if (!parseNumericEntity(token, codePoint))
+            {
+                result += L'&';
+                continue;
+            }
+            appendCodePoint(result, codePoint);
+        }
+        i = end;
+    }
+    return result;
+}
+
+std::wstring normalizeVisibleText(const std::wstring& value)
+{
+    std::wstring result;
+    bool pendingSpace = false;
+
+    for (std::size_t i = 0; i < value.size(); ++i)
+    {
+        const wchar_t ch = value[i];
+        if (ch == kCarriageReturn || ch == kLineFeed)
+        {
+            while (i + 1 < value.size() &&
+                   (value[i + 1] == kCarriageReturn || value[i + 1] == kLineFeed))
+            {
+                ++i;
+            }
+            while (!result.empty() && result.back() == L' ')
+            {
+                result.pop_back();
+            }
+            if (!result.empty() && result.back() != kLineFeed)
+            {
+                result += kLineFeed;
+            }
+            pendingSpace = false;
+        }
+        else if (std::iswspace(ch) != 0 || ch == static_cast<wchar_t>(0x00a0))
+        {
+            pendingSpace = true;
+        }
+        else
+        {
+            if (pendingSpace && !result.empty() && result.back() != kLineFeed)
+            {
+                result += L' ';
+            }
+            result += ch;
+            pendingSpace = false;
+        }
+    }
+
+    while (!result.empty() && (result.back() == L' ' || result.back() == kLineFeed))
+    {
+        result.pop_back();
+    }
+    return result;
+}
+
+std::wstring extractVisibleText(const std::wstring& html)
+{
+    std::wstring visible;
+    visible.reserve(html.size());
+    std::wstring rawTextTag;
+
+    for (std::size_t i = 0; i < html.size();)
+    {
+        if (!rawTextTag.empty())
+        {
+            std::size_t tagEnd = 0;
+            if (html[i] == L'<' && findClosingRawTag(html, i, rawTextTag, tagEnd))
+            {
+                rawTextTag.clear();
+                i = tagEnd + 1;
+            }
+            else
+            {
+                ++i;
+            }
+            continue;
+        }
+
+        if (i + 3 < html.size() && html.compare(i, 4, L"<!--") == 0)
+        {
+            const std::size_t commentEnd = html.find(L"-->", i + 4);
+            i = commentEnd == std::wstring::npos ? html.size() : commentEnd + 3;
+            continue;
+        }
+
+        if (html[i] == L'<')
+        {
+            const std::size_t tagEnd = findTagEnd(html, i + 1);
+            if (tagEnd == std::wstring::npos)
+            {
+                break;
+            }
+
+            const std::wstring rawTag = html.substr(i + 1, tagEnd - i - 1);
+            const std::wstring name = extractTagName(rawTag);
+            const bool closing = isClosingTag(rawTag);
+            if (!closing && (name == L"script" || name == L"style" || name == L"template"))
+            {
+                rawTextTag = name;
+            }
+            if (isBlockTag(name))
+            {
+                visible += kLineFeed;
+            }
+            i = tagEnd + 1;
+            continue;
+        }
+
+        visible += html[i++];
+    }
+
+    return normalizeVisibleText(decodeHtmlEntities(visible));
+}
+
+std::wstring currentPageContent()
+{
+    std::lock_guard<std::mutex> lock(g_pageState.mutex);
+    return g_pageState.html;
+}
+
+std::uint64_t beginPageRequest()
+{
+    std::lock_guard<std::mutex> lock(g_pageState.mutex);
+    if (g_pageState.closing)
+    {
+        return 0;
+    }
+    ++g_pageState.generation;
+    g_pageState.html = kLoadingPage;
+    return g_pageState.generation;
+}
+
+bool acceptPageContent(std::uint64_t generation, std::wstring html)
+{
+    std::lock_guard<std::mutex> lock(g_pageState.mutex);
+    if (g_pageState.closing || generation != g_pageState.generation)
+    {
+        return false;
+    }
+    g_pageState.html = std::move(html);
+    return true;
+}
+
+void workerStarted()
+{
+    std::lock_guard<std::mutex> lock(g_pageState.mutex);
+    ++g_pageState.activeWorkers;
+}
+
+void workerFinished()
+{
+    std::lock_guard<std::mutex> lock(g_pageState.mutex);
+    if (g_pageState.activeWorkers > 0)
+    {
+        --g_pageState.activeWorkers;
+    }
+    if (g_pageState.activeWorkers == 0)
+    {
+        g_pageState.workersFinished.notify_all();
+    }
+}
+
+void stopPageLoading()
+{
+    std::unique_lock<std::mutex> lock(g_pageState.mutex);
+    g_pageState.closing = true;
+    ++g_pageState.generation;
+    g_pageState.workersFinished.wait(lock, []
+    {
+        return g_pageState.activeWorkers == 0;
+    });
+}
+
+void renderText(Graphics& graphics, const std::wstring& text, int x, int y, int maxWidth)
+{
+    if (maxWidth <= 0)
+    {
+        return;
+    }
+
+    FontFamily family(L"Microsoft YaHei");
+    Font font(&family, 14.0f, FontStyleRegular, UnitPixel);
+    SolidBrush brush(Color(255, 32, 32, 32));
+    StringFormat format;
+    format.SetAlignment(StringAlignmentNear);
+    format.SetLineAlignment(StringAlignmentNear);
+    const RectF layoutRect(static_cast<float>(x), static_cast<float>(y), static_cast<float>(maxWidth), 10000.0f);
+    graphics.DrawString(text.c_str(), -1, &font, layoutRect, &format, &brush);
+}
+
+void loadUrlFromBar(HWND window)
+{
+    const std::wstring url = normalizeUrl(readWindowText(g_urlBar));
+    SetWindowTextW(g_urlBar, url.c_str());
+
+    const std::uint64_t generation = beginPageRequest();
+    if (generation == 0)
+    {
+        return;
+    }
+
+    InvalidateRect(window, nullptr, TRUE);
+    if (equalsInsensitive(url, L"about:blank"))
+    {
+        if (acceptPageContent(generation, kEmptyPage))
+        {
+            InvalidateRect(window, nullptr, TRUE);
+        }
+        return;
+    }
+
+    workerStarted();
+    try
+    {
+        std::thread([window, url, generation]
+        {
+            const std::wstring page = fetchUrl(url);
+            const bool accepted = acceptPageContent(generation, page);
+            workerFinished();
+            if (accepted)
+            {
+                PostMessageW(window, kPageLoadedMessage, 0, 0);
+            }
+        }).detach();
+    }
+    catch (...)
+    {
+        workerFinished();
+        if (acceptPageContent(generation, makeErrorPage(L"无法创建网络线程")))
+        {
+            InvalidateRect(window, nullptr, TRUE);
+        }
+    }
+}
+
+ATOM registerWindowClass(HINSTANCE instance)
+{
+    WNDCLASSEXW windowClass{};
+    windowClass.cbSize = sizeof(windowClass);
+    windowClass.style = CS_HREDRAW | CS_VREDRAW;
+    windowClass.lpfnWndProc = WndProc;
+    windowClass.hInstance = instance;
+    windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_KITTENSURF));
+    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    windowClass.lpszMenuName = MAKEINTRESOURCEW(IDC_KITTENSURF);
+    windowClass.lpszClassName = g_windowClass;
+    windowClass.hIconSm = LoadIconW(instance, MAKEINTRESOURCEW(IDI_SMALL));
+    return RegisterClassExW(&windowClass);
+}
+
+BOOL initializeInstance(HINSTANCE instance, int showCommand)
+{
+    g_instance = instance;
+    HWND window = CreateWindowW(
+        g_windowClass,
+        g_windowTitle,
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT,
+        0,
+        900,
+        650,
+        nullptr,
+        nullptr,
+        instance,
+        nullptr);
+
+    if (window == nullptr)
     {
         return FALSE;
     }
 
-    // ========== 加在这里 ==========
-    HMENU hMenu = LoadMenuW(hInstance, MAKEINTRESOURCE(IDC_KITTENSURF));
-    if (hMenu) SetMenu(hWnd, hMenu);
-    // ==============================
-
-    ShowWindow(hWnd, nCmdShow);
-    UpdateWindow(hWnd);
-
+    ShowWindow(window, showCommand);
+    UpdateWindow(window);
     return TRUE;
 }
+}
 
-//
-//  函数: WndProc(HWND, UINT, WPARAM, LPARAM)
-//  目标: 处理主窗口的消息。
-//
-LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+int APIENTRY wWinMain(
+    _In_ HINSTANCE instance,
+    _In_opt_ HINSTANCE previousInstance,
+    _In_ LPWSTR commandLine,
+    _In_ int showCommand)
 {
-    static ULONG_PTR gdiplusToken;
+    UNREFERENCED_PARAMETER(previousInstance);
+    UNREFERENCED_PARAMETER(commandLine);
 
+    if (LoadStringW(instance, IDS_APP_TITLE, g_windowTitle, kMaxLoadString) == 0)
+    {
+        lstrcpyW(g_windowTitle, L"kittensurf");
+    }
+    if (LoadStringW(instance, IDC_KITTENSURF, g_windowClass, kMaxLoadString) == 0)
+    {
+        lstrcpyW(g_windowClass, L"KITTENSURF");
+    }
+
+    if (registerWindowClass(instance) == 0 || !initializeInstance(instance, showCommand))
+    {
+        return FALSE;
+    }
+
+    HACCEL accelerators = LoadAcceleratorsW(instance, MAKEINTRESOURCEW(IDC_KITTENSURF));
+    MSG message{};
+    int messageResult = 0;
+    while ((messageResult = GetMessageW(&message, nullptr, 0, 0)) > 0)
+    {
+        if (accelerators == nullptr || !TranslateAcceleratorW(message.hwnd, accelerators, &message))
+        {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+
+    return messageResult == -1 ? 1 : static_cast<int>(message.wParam);
+}
+
+LRESULT CALLBACK WndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
     switch (message)
     {
     case WM_CREATE:
     {
-        GdiplusStartupInput gdiplusStartupInput;
-        GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+        GdiplusStartupInput startupInput{};
+        if (GdiplusStartup(&g_gdiplusToken, &startupInput, nullptr) != Ok)
+        {
+            g_gdiplusToken = 0;
+        }
 
-        // 创建网址栏
-        g_hUrlBar = CreateWindowW(L"Edit", L"https://space.bilibili.com/1915578481/",
-            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-            10, 10, 400, 26, hWnd, NULL, hInst, NULL);
+        g_urlBar = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"EDIT",
+            L"https://example.com/",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            10,
+            10,
+            700,
+            28,
+            window,
+            nullptr,
+            g_instance,
+            nullptr);
 
-        // 创建跳转按钮
-        g_hGoButton = CreateWindowW(L"Button", L"前往",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            420, 10, 60, 26, hWnd, (HMENU)1, hInst, NULL);
+        g_goButton = CreateWindowW(
+            L"BUTTON",
+            L"前往",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            720,
+            10,
+            70,
+            28,
+            window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kGoButtonId)),
+            g_instance,
+            nullptr);
 
-        // 初始加载
-        loadUrlFromBar(hWnd);
-        break;
+        if (g_urlBar == nullptr || g_goButton == nullptr)
+        {
+            if (g_gdiplusToken != 0)
+            {
+                GdiplusShutdown(g_gdiplusToken);
+                g_gdiplusToken = 0;
+            }
+            return -1;
+        }
+
+        loadUrlFromBar(window);
+        return 0;
     }
 
     case WM_COMMAND:
-    {
-        int wmId = LOWORD(wParam);
-
-        // 点击“前往”按钮（ID = 1）
-        if (wmId == 1)
+        switch (LOWORD(wParam))
         {
-            loadUrlFromBar(hWnd);
-        }
-
-        // 分析菜单选择:
-        switch (wmId)
-        {
+        case kGoButtonId:
+            if (HIWORD(wParam) == BN_CLICKED)
+            {
+                loadUrlFromBar(window);
+                return 0;
+            }
+            break;
         case IDM_ABOUT:
-            DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
-            break;
+            DialogBoxW(g_instance, MAKEINTRESOURCEW(IDD_ABOUTBOX), window, About);
+            return 0;
         case IDM_EXIT:
-            DestroyWindow(hWnd);
-            break;
+            DestroyWindow(window);
+            return 0;
         default:
-            return DefWindowProc(hWnd, message, wParam, lParam);
+            break;
         }
-        break;
-    }
+        return DefWindowProcW(window, message, wParam, lParam);
 
     case WM_SIZE:
     {
-        RECT rect;
-        GetClientRect(hWnd, &rect);
-        if (g_hUrlBar && g_hGoButton)
+        RECT clientRect{};
+        GetClientRect(window, &clientRect);
+        const int clientWidth = std::max(0, static_cast<int>(clientRect.right - clientRect.left));
+        constexpr int margin = 10;
+        constexpr int buttonWidth = 70;
+        const int buttonLeft = std::max(margin, clientWidth - margin - buttonWidth);
+        const int barWidth = std::max(0, clientWidth - margin * 3 - buttonWidth);
+
+        if (g_urlBar != nullptr)
         {
-            int btnW = 70;
-            int barWidth = rect.right - 20 - btnW;
-            int btnLeft = rect.right - btnW - 10;
-            SetWindowPos(g_hUrlBar, NULL, 10, 10, barWidth, 28, SWP_NOZORDER);
-            SetWindowPos(g_hGoButton, NULL, btnLeft, 10, btnW, 28, SWP_NOZORDER);
+            SetWindowPos(g_urlBar, nullptr, margin, margin, barWidth, 28, SWP_NOZORDER | SWP_NOACTIVATE);
         }
-        break;
+        if (g_goButton != nullptr)
+        {
+            SetWindowPos(g_goButton, nullptr, buttonLeft, margin, buttonWidth, 28, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        return 0;
     }
+
+    case kPageLoadedMessage:
+        InvalidateRect(window, nullptr, TRUE);
+        return 0;
 
     case WM_PAINT:
     {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hWnd, &ps);
-        Graphics graphics(hdc);
-        graphics.Clear(Color(255, 255, 255));
+        PAINTSTRUCT paint{};
+        HDC deviceContext = BeginPaint(window, &paint);
+        RECT clientRect{};
+        GetClientRect(window, &clientRect);
+        const std::wstring page = currentPageContent();
+        std::wstring text = extractVisibleText(page);
+        if (text.empty())
+        {
+            text = L"页面内容为空（可能包含动态脚本）";
+        }
 
-        RECT rect;
-        GetClientRect(hWnd, &rect);
-        std::wstring text = extractVisibleText(g_htmlContent);
-        if (text.empty()) text = L"页面内容为空（可能包含大量动态脚本）";
-        renderText(graphics, text, 20, 50, rect.right - 40);
+        if (g_gdiplusToken != 0)
+        {
+            Graphics graphics(deviceContext);
+            graphics.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+            graphics.Clear(Color(255, 255, 255, 255));
+            renderText(graphics, text, 20, 55, std::max(0, static_cast<int>(clientRect.right - 40)));
+        }
+        else
+        {
+            FillRect(deviceContext, &clientRect, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
+            TextOutW(deviceContext, 20, 55, text.c_str(), static_cast<int>(text.size()));
+        }
 
-        EndPaint(hWnd, &ps);
-        break;
+        EndPaint(window, &paint);
+        return 0;
     }
 
     case WM_DESTROY:
-    {
-        GdiplusShutdown(gdiplusToken);
+        stopPageLoading();
+        if (g_gdiplusToken != 0)
+        {
+            GdiplusShutdown(g_gdiplusToken);
+            g_gdiplusToken = 0;
+        }
+        g_urlBar = nullptr;
+        g_goButton = nullptr;
         PostQuitMessage(0);
-        break;
-    }
+        return 0;
 
     default:
-        return DefWindowProc(hWnd, message, wParam, lParam);
+        return DefWindowProcW(window, message, wParam, lParam);
     }
-    return 0;
 }
 
-// “关于”框的消息处理程序。
-INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
+INT_PTR CALLBACK About(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
 {
     UNREFERENCED_PARAMETER(lParam);
     switch (message)
     {
     case WM_INITDIALOG:
-        return (INT_PTR)TRUE;
-
+        return static_cast<INT_PTR>(TRUE);
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
         {
-            EndDialog(hDlg, LOWORD(wParam));
-            return (INT_PTR)TRUE;
+            EndDialog(dialog, LOWORD(wParam));
+            return static_cast<INT_PTR>(TRUE);
         }
         break;
+    default:
+        break;
     }
-    return (INT_PTR)FALSE;
+    return static_cast<INT_PTR>(FALSE);
 }
