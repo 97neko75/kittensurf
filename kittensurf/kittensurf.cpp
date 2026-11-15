@@ -10,8 +10,10 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cwctype>
+#include <cwchar>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -24,12 +26,19 @@
 
 using namespace Gdiplus;
 
+ATOM registerWindowClass(HINSTANCE instance);
+BOOL initializeInstance(HINSTANCE instance, int showCommand);
+LRESULT CALLBACK WndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+INT_PTR CALLBACK About(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam);
+
 namespace
 {
 constexpr int kMaxLoadString = 100;
 constexpr int kGoButtonId = 1;
 constexpr UINT kPageLoadedMessage = WM_APP + 1;
 constexpr std::size_t kMaxDocumentBytes = 16u * 1024u * 1024u;
+constexpr wchar_t kCarriageReturn = static_cast<wchar_t>(13);
+constexpr wchar_t kLineFeed = static_cast<wchar_t>(10);
 
 constexpr wchar_t kLoadingPage[] = L"<html><body><p>正在加载...</p></body></html>";
 constexpr wchar_t kEmptyPage[] = L"<html><body></body></html>";
@@ -111,7 +120,7 @@ wchar_t lowerWide(wchar_t value)
 
 bool equalsInsensitive(const std::wstring& value, const wchar_t* expected)
 {
-    const std::size_t expectedLength = wcslen(expected);
+    const std::size_t expectedLength = std::wcslen(expected);
     if (value.size() != expectedLength)
     {
         return false;
@@ -129,7 +138,7 @@ bool equalsInsensitive(const std::wstring& value, const wchar_t* expected)
 
 bool startsWithInsensitive(const std::wstring& value, const wchar_t* prefix)
 {
-    const std::size_t prefixLength = wcslen(prefix);
+    const std::size_t prefixLength = std::wcslen(prefix);
     if (value.size() < prefixLength)
     {
         return false;
@@ -177,7 +186,6 @@ std::wstring normalizeUrl(const std::wstring& value)
         return trimmed;
     }
 
-    // A hostname typed without a scheme is treated as HTTPS by default.
     return L"https://" + trimmed;
 }
 
@@ -194,7 +202,7 @@ std::wstring readWindowText(HWND window)
         return {};
     }
 
-    std::wstring value(static_cast<std::size_t>(length) + 1, L'\\0');
+    std::wstring value(static_cast<std::size_t>(length) + 1, wchar_t{});
     const int copied = GetWindowTextW(window, value.data(), static_cast<int>(value.size()));
     value.resize(copied > 0 ? static_cast<std::size_t>(copied) : 0);
     return value;
@@ -232,7 +240,6 @@ std::wstring decodeResponse(const std::string& bytes)
     UINT codePage = CP_UTF8;
     DWORD flags = MB_ERR_INVALID_CHARS;
 
-    // A page may omit its charset declaration or use a legacy code page.
     if (wideLength <= 0)
     {
         codePage = CP_ACP;
@@ -245,7 +252,7 @@ std::wstring decodeResponse(const std::string& bytes)
         return {};
     }
 
-    std::wstring result(static_cast<std::size_t>(wideLength), L'\\0');
+    std::wstring result(static_cast<std::size_t>(wideLength), wchar_t{});
     if (MultiByteToWideChar(codePage, flags, data, length, result.data(), wideLength) <= 0)
     {
         return {};
@@ -266,9 +273,9 @@ std::wstring fetchUrl(const std::wstring& url)
         return makeErrorPage(L"URL 太长");
     }
 
-    std::vector<wchar_t> hostBuffer(url.size() + 1, L'\\0');
-    std::vector<wchar_t> pathBuffer(url.size() + 1, L'\\0');
-    std::vector<wchar_t> extraBuffer(url.size() + 1, L'\\0');
+    std::vector<wchar_t> hostBuffer(url.size() + 1);
+    std::vector<wchar_t> pathBuffer(url.size() + 1);
+    std::vector<wchar_t> extraBuffer(url.size() + 1);
 
     URL_COMPONENTS components{};
     components.dwStructSize = sizeof(components);
@@ -299,7 +306,6 @@ std::wstring fetchUrl(const std::wstring& url)
     std::wstring requestTarget(pathBuffer.data(), components.dwUrlPathLength);
     std::wstring extraInfo(extraBuffer.data(), components.dwExtraInfoLength);
 
-    // Fragments are client-side only and must not be sent to the server.
     const std::size_t fragment = extraInfo.find(L'#');
     if (fragment != std::wstring::npos)
     {
@@ -346,10 +352,7 @@ std::wstring fetchUrl(const std::wstring& url)
         return makeErrorPage(L"请求创建失败");
     }
 
-    constexpr wchar_t requestHeaders[] =
-        L"Accept: text/html, text/plain;q=0.9, */*;q=0.1\\r\\n"
-        L"Accept-Encoding: identity\\r\\n";
-
+    constexpr wchar_t requestHeaders[] = L"Accept-Encoding: identity";
     if (!WinHttpSendRequest(
         request.get(),
         requestHeaders,
@@ -423,7 +426,7 @@ std::size_t findTagEnd(const std::wstring& html, std::size_t begin)
                 quote = 0;
             }
         }
-        else if (ch == L'\'' || ch == L'"')
+        else if (ch == static_cast<wchar_t>(39) || ch == L'"')
         {
             quote = ch;
         }
@@ -451,16 +454,12 @@ std::wstring extractTagName(const std::wstring& rawTag)
         ++begin;
     }
 
-    const std::size_t end = [&]()
+    std::size_t end = begin;
+    while (end < rawTag.size() &&
+           (std::iswalnum(rawTag[end]) != 0 || rawTag[end] == L'-' || rawTag[end] == L'_'))
     {
-        std::size_t cursor = begin;
-        while (cursor < rawTag.size() &&
-               (std::iswalnum(rawTag[cursor]) != 0 || rawTag[cursor] == L'-' || rawTag[cursor] == L'_'))
-        {
-            ++cursor;
-        }
-        return cursor;
-    }();
+        ++end;
+    }
 
     std::wstring name = rawTag.substr(begin, end - begin);
     for (wchar_t& ch : name)
@@ -548,7 +547,7 @@ void appendCodePoint(std::wstring& output, std::uint32_t codePoint)
     if (codePoint == 0 || codePoint > 0x10ffff ||
         (codePoint >= 0xd800 && codePoint <= 0xdfff))
     {
-        output += L'\uFFFD';
+        output += static_cast<wchar_t>(0xfffd);
         return;
     }
 
@@ -636,8 +635,8 @@ std::wstring decodeHtmlEntities(const std::wstring& value)
         else if (token == L"lt") result += L'<';
         else if (token == L"gt") result += L'>';
         else if (token == L"quot") result += L'"';
-        else if (token == L"apos") result += L'\'';
-        else if (token == L"nbsp") result += L'\u00A0';
+        else if (token == L"apos") result += static_cast<wchar_t>(39);
+        else if (token == L"nbsp") result += static_cast<wchar_t>(0x00a0);
         else
         {
             std::uint32_t codePoint = 0;
@@ -661,9 +660,10 @@ std::wstring normalizeVisibleText(const std::wstring& value)
     for (std::size_t i = 0; i < value.size(); ++i)
     {
         const wchar_t ch = value[i];
-        if (ch == L'\r' || ch == L'\n')
+        if (ch == kCarriageReturn || ch == kLineFeed)
         {
-            while (i + 1 < value.size() && (value[i + 1] == L'\r' || value[i + 1] == L'\n'))
+            while (i + 1 < value.size() &&
+                   (value[i + 1] == kCarriageReturn || value[i + 1] == kLineFeed))
             {
                 ++i;
             }
@@ -671,19 +671,19 @@ std::wstring normalizeVisibleText(const std::wstring& value)
             {
                 result.pop_back();
             }
-            if (!result.empty() && result.back() != L'\n')
+            if (!result.empty() && result.back() != kLineFeed)
             {
-                result += L'\n';
+                result += kLineFeed;
             }
             pendingSpace = false;
         }
-        else if (std::iswspace(ch) != 0 || ch == L'\u00A0')
+        else if (std::iswspace(ch) != 0 || ch == static_cast<wchar_t>(0x00a0))
         {
             pendingSpace = true;
         }
         else
         {
-            if (pendingSpace && !result.empty() && result.back() != L'\n')
+            if (pendingSpace && !result.empty() && result.back() != kLineFeed)
             {
                 result += L' ';
             }
@@ -692,7 +692,7 @@ std::wstring normalizeVisibleText(const std::wstring& value)
         }
     }
 
-    while (!result.empty() && (result.back() == L' ' || result.back() == L'\n'))
+    while (!result.empty() && (result.back() == L' ' || result.back() == kLineFeed))
     {
         result.pop_back();
     }
@@ -746,7 +746,7 @@ std::wstring extractVisibleText(const std::wstring& html)
             }
             if (isBlockTag(name))
             {
-                visible += L'\n';
+                visible += kLineFeed;
             }
             i = tagEnd + 1;
             continue;
@@ -940,8 +940,7 @@ int APIENTRY wWinMain(
         lstrcpyW(g_windowClass, L"KITTENSURF");
     }
 
-    registerWindowClass(instance);
-    if (!initializeInstance(instance, showCommand))
+    if (registerWindowClass(instance) == 0 || !initializeInstance(instance, showCommand))
     {
         return FALSE;
     }
@@ -1039,7 +1038,7 @@ LRESULT CALLBACK WndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam
     {
         RECT clientRect{};
         GetClientRect(window, &clientRect);
-        const int clientWidth = std::max(0L, clientRect.right - clientRect.left);
+        const int clientWidth = std::max(0, static_cast<int>(clientRect.right - clientRect.left));
         constexpr int margin = 10;
         constexpr int buttonWidth = 70;
         const int buttonLeft = std::max(margin, clientWidth - margin - buttonWidth);
@@ -1078,7 +1077,7 @@ LRESULT CALLBACK WndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam
             Graphics graphics(deviceContext);
             graphics.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
             graphics.Clear(Color(255, 255, 255, 255));
-            renderText(graphics, text, 20, 55, std::max(0L, clientRect.right - 40));
+            renderText(graphics, text, 20, 55, std::max(0, static_cast<int>(clientRect.right - 40)));
         }
         else
         {
